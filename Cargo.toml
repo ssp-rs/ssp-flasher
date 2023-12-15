@@ -1,0 +1,17 @@
+[package]
+name = "ssp-flasher"
+version = "0.1.0"
+edition = "2021"
+authors = ["SSP Rust Developers"]
+description = "Firmware flashing tool for ITL validators using the SSP serial communication protocol"
+keywords = ["no-std", "serial", "ssp", "bill-acceptor", "bill-validator"]
+categories = ["command-line-interface", "finance", "hardware-support"]
+repository = "https://github.com/ssp-rs/ssp-flasher"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.2.1", features = ["derive"] }
+env_logger = "0.10"
+log = "0.4"
+serialport = { version = "4.2", default-features = false }
+ssp = { version = "0.5", git = "https://github.com/ssp-rs/ssp", features = ["std"] }
