@@ -26,10 +26,10 @@ fn connect(serial_path: &str, baud_rate: u32) -> Result<TTYPort> {
         .flow_control(serialport::FlowControl::None)
         // seven-bit data size
         .data_bits(serialport::DataBits::Eight)
-        // even control bit parity
-        .parity(serialport::Parity::Even)
-        // one bit stop
-        .stop_bits(serialport::StopBits::One)
+        // no control bit parity
+        .parity(serialport::Parity::None)
+        // two bit stop
+        .stop_bits(serialport::StopBits::Two)
         // serial device times out after one second, so do we
         .timeout(time::Duration::from_secs(1))
         // get back a TTY port for POSIX systems, Windows is not supported
@@ -57,6 +57,8 @@ fn send_sync(port: &mut TTYPort) -> Result<()> {
 }
 
 fn send_program_firmware_command(port: &mut TTYPort) -> Result<u16> {
+    log::debug!("Sending ProgramFirmware command...");
+
     let mut program_cmd = ssp::ProgramFirmwareCommand::new();
     port.write_all(program_cmd.as_bytes())?;
 
@@ -66,6 +68,8 @@ fn send_program_firmware_command(port: &mut TTYPort) -> Result<u16> {
 
     let block_len = program_res.block_len();
     log::info!("Received expected block length: {block_len}");
+
+    log::debug!("ProgramFirmware command successful");
 
     Ok(block_len)
 }
