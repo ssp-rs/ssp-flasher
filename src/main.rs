@@ -100,6 +100,11 @@ fn send_header(port: &mut TTYPort, header: &FirmwareHeader) -> Result<()> {
 fn send_ram(port: &mut TTYPort, mut ram: FirmwareRam) -> Result<()> {
     log::debug!("Sending firmware RAM...");
 
+    let len = ram.len();
+    let sections = len / 128;
+    let remainder = len % 128;
+    log::debug!("RAM section length: {len}, sections: {sections}, remainder: {remainder}");
+
     let mut checksum = 0u8;
 
     while let Some(section) = ram.next_section() {
@@ -110,6 +115,8 @@ fn send_ram(port: &mut TTYPort, mut ram: FirmwareRam) -> Result<()> {
     let mut res_checksum = [0u8];
     port.read_exact(res_checksum.as_mut())?;
     port.flush()?;
+
+    log::debug!("RAM response checksum: {:#04x?}", res_checksum[0]);
 
     validate_checksum(checksum, res_checksum[0])?;
 
@@ -134,7 +141,9 @@ fn validate_checksum(checksum: u8, res_checksum: u8) -> Result<()> {
     if checksum == res_checksum {
         Ok(())
     } else {
-        Err(Error::Firmware(format!("error sending firmware RAM block, invalid checksum, have: {res_checksum}, expected: {checksum}")))
+        let err_msg = format!("error sending firmware RAM block, invalid checksum, have: {res_checksum}, expected: {checksum}");
+        log::error!("{err_msg}");
+        Err(Error::Firmware(err_msg))
     }
 }
 
