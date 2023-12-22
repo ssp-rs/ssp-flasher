@@ -14,4 +14,8 @@ clap = { version = "4.2.1", features = ["derive"] }
 env_logger = "0.10"
 log = "0.4"
 serialport = { version = "4.2", default-features = false }
-ssp = { version = "0.5", git = "https://github.com/ssp-rs/ssp", features = ["std"] }
+
+[dependencies.ssp]
+version = "0.5"
+git = "https://github.com/ssp-rs/ssp"
+features = ["std"]
