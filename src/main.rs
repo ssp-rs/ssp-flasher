@@ -3,10 +3,9 @@ use std::thread;
 use std::time;
 
 use clap::Parser;
-use serialport::{SerialPort, TTYPort};
+use serialport::TTYPort;
 
 use ssp::{Error, FirmwareData, FirmwareHeader, FirmwareRam, MessageOps, ResponseOps, Result};
-use ssp::{FIRMWARE_ACK, FIRMWARE_DATA_SECTION_LEN, FIRMWARE_HEADER_LEN};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -56,10 +55,17 @@ fn send_sync(port: &mut TTYPort) -> Result<()> {
     }
 }
 
+fn send_reset(port: &mut TTYPort) -> Result<()> {
+    let mut reset = ssp::ResetCommand::new();
+    port.write_all(reset.as_bytes())?;
+
+    Ok(())
+}
+
 fn send_program_firmware_command(port: &mut TTYPort) -> Result<u16> {
     log::debug!("Sending ProgramFirmware command...");
 
-    let mut program_cmd = ssp::ProgramFirmwareCommand::new();
+    let mut program_cmd = ssp::ProgramFirmwareCommand::create(ssp::ProgramFirmwareCode::Currency);
     port.write_all(program_cmd.as_bytes())?;
 
     let mut program_res = ssp::ProgramFirmwareResponse::new();
@@ -78,148 +84,67 @@ fn send_program_firmware_command(port: &mut TTYPort) -> Result<u16> {
 fn send_header(port: &mut TTYPort, header: &FirmwareHeader) -> Result<()> {
     log::debug!("Sending firmware header...");
 
-    let mut header_cmd = ssp::FirmwareHeaderCommand::create(header)?;
-    port.write_all(header_cmd.as_bytes())?;
+    let header_buf: [u8; ssp::FIRMWARE_HEADER_LEN] = header.try_into()?;
+    send_data_packet(
+        port,
+        ssp::SequenceId::new(),
+        0xffff_ffff,
+        0,
+        header_buf.as_ref(),
+    )?;
 
-    let mut header_res = ssp::FirmwareHeaderResponse::new();
-    port.read_exact(header_res.buf_mut())?;
+    log::debug!("Successfully sent firmware header");
 
-    let status = header_res.response_status();
-    if status != ssp::ResponseStatus::Ok {
-        let expected = ssp::ResponseStatus::Ok;
-        Err(Error::Firmware(format!(
-            "error sending firmware header, have: {status}, expected: {expected}"
-        )))
-    } else {
-        log::debug!("Successfully sent firmware header");
-        Ok(())
-    }
+    Ok(())
 }
 
 // Send the firmware RAM code to the unit.
 fn send_ram(port: &mut TTYPort, mut ram: FirmwareRam) -> Result<()> {
     log::debug!("Sending firmware RAM...");
 
-    let len = ram.len();
-    let sections = len / 128;
-    let remainder = len % 128;
-    log::debug!("RAM section length: {len}, sections: {sections}, remainder: {remainder}");
-
-    let mut checksum = 0u8;
+    let mut block = 0xffff_fffe;
+    let mut line = 0;
+    let mut seq_id = ssp::SequenceId::new();
 
     while let Some(section) = ram.next_section() {
-        section.iter().for_each(|&b| checksum ^= b);
-        port.write_all(section)?;
+        seq_id.toggle_flag();
+
+        send_data_packet(port, seq_id, block, line, section)?;
+
+        // advance to the next "line"
+        line = line.saturating_add(1);
+        // if line is at the max, advance to next block
+        if line == 255 {
+            block = block.saturating_sub(1);
+            line = 0;
+        }
     }
-
-    let mut res_checksum = [0u8];
-    port.read_exact(res_checksum.as_mut())?;
-    port.flush()?;
-
-    log::debug!("RAM response checksum: {:#04x?}", res_checksum[0]);
-
-    validate_checksum(checksum, res_checksum[0])?;
 
     log::debug!("Successfully sent firmware RAM");
 
     Ok(())
 }
 
-// Check the response from a raw transmission is ACKed by the unit.
-fn check_ack(res: u8) -> Result<()> {
-    if res == FIRMWARE_ACK {
-        Ok(())
-    } else {
-        Err(Error::Firmware(format!(
-            "error sending firmware file code, expected ACK, have: {res}, expected: {FIRMWARE_ACK}"
-        )))
-    }
-}
-
-// Validate the response checksum matches the one calculated locally.
-fn validate_checksum(checksum: u8, res_checksum: u8) -> Result<()> {
-    if checksum == res_checksum {
-        Ok(())
-    } else {
-        let err_msg = format!("error sending firmware RAM block, invalid checksum, have: {res_checksum}, expected: {checksum}");
-        log::error!("{err_msg}");
-        Err(Error::Firmware(err_msg))
-    }
-}
-
 // Send the firmware dataset to the unit.
-fn send_dataset(port: &mut TTYPort, mut data: FirmwareData, header: &FirmwareHeader) -> Result<()> {
+fn send_dataset(port: &mut TTYPort, mut data: FirmwareData) -> Result<()> {
     log::debug!("Sending firmware dataset...");
 
-    // Send the firmware file code to the unit
-    let code = header.file_code();
-    port.write_all(&[code])?;
+    let mut block = 0xffff_fffe;
+    let mut line = 0;
+    let mut seq_id = ssp::SequenceId::new();
 
-    // Check for an ACK response
-    let mut res_buf = [0u8];
-    port.read_exact(res_buf.as_mut())?;
-    port.flush()?;
-    check_ack(res_buf[0])?;
+    while let Some(section) = data.next_section() {
+        seq_id.toggle_flag();
 
-    // Send the header block as raw bytes
-    let header_block: [u8; FIRMWARE_HEADER_LEN] = header.try_into()?;
-    port.write_all(header_block.as_ref())?;
-    port.read_exact(res_buf.as_mut())?;
-    check_ack(res_buf[0])?;
+        send_data_packet(port, seq_id, block, line, section)?;
 
-    let data_len = data.len();
-    let block_len = data.block_len();
-    let blocks = data_len / block_len;
-    let block_sections = block_len / FIRMWARE_DATA_SECTION_LEN;
-    let sections = (data_len / FIRMWARE_DATA_SECTION_LEN)
-        + ((data_len % FIRMWARE_DATA_SECTION_LEN != 0) as usize);
-    let block_rem = data_len % block_len;
-
-    // Send the dataset in "blocks" that are further subdivided into section lengths (128 bytes)
-    for block in 0..blocks {
-        let mut checksum = 0u8;
-
-        for block_section in 0..block_sections {
-            let section_num = (block * block_sections) + block_section;
-
-            // Write the next 128 byte section
-            let section = data.next_section().ok_or(Error::Firmware(format!(
-                "invalid firmware data sections, have: {section_num}, expected: {sections}"
-            )))?;
-            // Calculate the XOR checksum for this section
-            section.iter().for_each(|&b| checksum ^= b);
-            port.write_all(section)?;
+        // advance to the next "line"
+        line = line.saturating_add(1);
+        // if line is at the max, advance to next block
+        if line == 255 {
+            block = block.saturating_sub(1);
+            line = 0;
         }
-
-        // Write the calculate block checksum to the unit
-        port.write_all(&[checksum])?;
-
-        // Read the response checksum from the unit
-        let mut res_checksum = [0u8];
-        port.read_exact(res_checksum.as_mut())?;
-        port.flush()?;
-
-        // Validate that the checksums match
-        validate_checksum(checksum, res_checksum[0])?;
-    }
-
-    // If the dataset is not divided equally into blocks,
-    // send the remaining data in section lengths (128 bytes)
-    if block_rem != 0 {
-        let mut checksum = 0u8;
-
-        while let Some(section) = data.next_section() {
-            section.iter().for_each(|&b| checksum ^= b);
-            port.write_all(section)?;
-        }
-
-        port.write_all(&[checksum])?;
-
-        let mut res_checksum = [0u8];
-        port.read_exact(res_checksum.as_mut())?;
-        port.flush()?;
-
-        validate_checksum(checksum, res_checksum[0])?;
     }
 
     log::debug!("Successfully sent firmware dataset");
@@ -227,12 +152,46 @@ fn send_dataset(port: &mut TTYPort, mut data: FirmwareData, header: &FirmwareHea
     Ok(())
 }
 
+// Send a data packet to the device.
+fn send_data_packet(
+    port: &mut TTYPort,
+    seq_id: ssp::SequenceId,
+    block: u32,
+    line: u8,
+    data: &[u8],
+) -> Result<()> {
+    let mut data_cmd = ssp::DownloadDataPacketCommand::create(block, line, data)?;
+    data_cmd.set_sequence_id(seq_id);
+
+    port.write_all(data_cmd.as_bytes())?;
+
+    let mut data_res = ssp::DownloadDataPacketResponse::new();
+    let read = port.read(data_res.buf_mut())?;
+
+    let exp_len = data_res.len();
+    if read != exp_len {
+        return Err(Error::InvalidLength((read, exp_len)));
+    }
+
+    data_res.verify_checksum()?;
+
+    let status = data_res.response_status();
+    let exp_status = ssp::ResponseStatus::Ok;
+    if status == exp_status {
+        Ok(())
+    } else {
+        Err(Error::Firmware(format!(
+            "invalid firmware download status: {status}, expected: {exp_status}"
+        )))
+    }
+}
+
 // Send the ITL firmware file to the unit over SSP.
 fn send_firmware(serial_path: &str, file_path: &str) -> Result<()> {
     log::info!("Sending firmware file...");
     log::debug!("Firmware file path: {file_path}");
 
-    let (header, ram, mut data) = ssp::parse_firmware_file(file_path)?;
+    let (header, ram, data) = ssp::parse_firmware_file(file_path)?;
 
     log::debug!("Firmware header: {header}");
 
@@ -240,13 +199,9 @@ fn send_firmware(serial_path: &str, file_path: &str) -> Result<()> {
 
     send_sync(&mut port)?;
 
-    let block_len = send_program_firmware_command(&mut port)?;
-    data.set_block_len(block_len);
+    send_program_firmware_command(&mut port)?;
 
     send_header(&mut port, &header)?;
-
-    // increase baud rate for sending RAM and dataset blocks
-    port.set_baud_rate(38400)?;
 
     send_ram(&mut port, ram)?;
 
@@ -254,9 +209,15 @@ fn send_firmware(serial_path: &str, file_path: &str) -> Result<()> {
     // (recommended by SSP Implementation Guide)
     thread::sleep(time::Duration::from_millis(2500));
 
-    send_dataset(&mut port, data, &header)?;
+    send_sync(&mut port)?;
+
+    send_header(&mut port, &header)?;
+
+    send_dataset(&mut port, data)?;
 
     log::info!("Successfully sent firmware file");
+
+    send_reset(&mut port)?;
 
     Ok(())
 }
