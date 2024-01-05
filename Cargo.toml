@@ -18,4 +18,5 @@ serialport = { version = "4.2", default-features = false }
 [dependencies.ssp]
 version = "0.5"
 git = "https://github.com/ssp-rs/ssp"
+branch = "feature/firmware-download"
 features = ["std"]

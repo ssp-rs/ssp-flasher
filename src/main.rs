@@ -65,7 +65,10 @@ fn send_reset(port: &mut TTYPort) -> Result<()> {
 fn send_program_firmware_command(port: &mut TTYPort) -> Result<u16> {
     log::debug!("Sending ProgramFirmware command...");
 
-    let mut program_cmd = ssp::ProgramFirmwareCommand::create(ssp::ProgramFirmwareCode::Currency);
+    let mut program_cmd = ssp::ProgramFirmwareCommand::create(
+        ssp::ProgramFirmwareCode::Currency,
+        ssp::ProgramFirmwareType::Currency,
+    );
     port.write_all(program_cmd.as_bytes())?;
 
     let mut program_res = ssp::ProgramFirmwareResponse::new();
@@ -75,48 +78,62 @@ fn send_program_firmware_command(port: &mut TTYPort) -> Result<u16> {
     let block_len = program_res.block_len();
     log::info!("Received expected block length: {block_len}");
 
-    log::debug!("ProgramFirmware command successful");
-
-    Ok(block_len)
+    let status = program_res.response_status();
+    if status.is_ok() {
+        log::debug!("ProgramFirmware command successful");
+        Ok(block_len)
+    } else {
+        let exp_status = ssp::ResponseStatus::Ok;
+        let err_msg = format!("Expected OK response, have: {status}, expected: {exp_status}");
+        Err(Error::Firmware(err_msg))
+    }
 }
 
 // Send the firmware header to the unit.
 fn send_header(port: &mut TTYPort, header: &FirmwareHeader) -> Result<()> {
     log::debug!("Sending firmware header...");
 
+    let mut seq_id = ssp::SequenceId::new();
+    seq_id.toggle_flag();
+
     let header_buf: [u8; ssp::FIRMWARE_HEADER_LEN] = header.try_into()?;
-    send_data_packet(
-        port,
-        ssp::SequenceId::new(),
-        0xffff_ffff,
-        0,
-        header_buf.as_ref(),
-    )?;
-
-    log::debug!("Successfully sent firmware header");
-
-    Ok(())
+    match send_data_packet(port, seq_id, 0xffff_ffff, 0, header_buf.as_ref()) {
+        Ok(_res) => {
+            log::debug!("Successfully sent firmware header");
+            Ok(())
+        }
+        Err(err) => {
+            log::error!("Error sending firmware header: {err}");
+            Err(err)
+        }
+    }
 }
 
 // Send the firmware RAM code to the unit.
-fn send_ram(port: &mut TTYPort, mut ram: FirmwareRam) -> Result<()> {
+fn send_ram(port: &mut TTYPort, mut ram: FirmwareRam, block_len: usize) -> Result<()> {
     log::debug!("Sending firmware RAM...");
 
     let mut block = 0xffff_fffe;
     let mut line = 0;
+    let mut sent = 0usize;
     let mut seq_id = ssp::SequenceId::new();
 
     while let Some(section) = ram.next_section() {
         seq_id.toggle_flag();
 
-        send_data_packet(port, seq_id, block, line, section)?;
+        if let Err(err) = send_data_packet(port, seq_id, block, line, section) {
+            log::error!("error sending RAM data packet: {err}, block: {block:#x}, line: {line}");
+            return Err(err);
+        }
 
         // advance to the next "line"
         line = line.saturating_add(1);
+        sent = sent.saturating_add(section.len());
         // if line is at the max, advance to next block
-        if line == 255 {
+        if line == 255 || sent == block_len {
             block = block.saturating_sub(1);
             line = 0;
+            sent = 0;
         }
     }
 
@@ -126,24 +143,32 @@ fn send_ram(port: &mut TTYPort, mut ram: FirmwareRam) -> Result<()> {
 }
 
 // Send the firmware dataset to the unit.
-fn send_dataset(port: &mut TTYPort, mut data: FirmwareData) -> Result<()> {
+fn send_dataset(port: &mut TTYPort, mut data: FirmwareData, block_len: usize) -> Result<()> {
     log::debug!("Sending firmware dataset...");
 
     let mut block = 0xffff_fffe;
     let mut line = 0;
+    let mut sent = 0usize;
     let mut seq_id = ssp::SequenceId::new();
 
     while let Some(section) = data.next_section() {
         seq_id.toggle_flag();
 
-        send_data_packet(port, seq_id, block, line, section)?;
+        if let Err(err) = send_data_packet(port, seq_id, block, line, section) {
+            log::error!(
+                "error sending dataset data packet: {err}, block: {block:#x}, line: {line}"
+            );
+            return Err(err);
+        }
 
         // advance to the next "line"
         line = line.saturating_add(1);
+        sent = sent.saturating_add(section.len());
         // if line is at the max, advance to next block
-        if line == 255 {
+        if line == 255 || sent == block_len {
             block = block.saturating_sub(1);
             line = 0;
+            sent = 0;
         }
     }
 
@@ -159,7 +184,7 @@ fn send_data_packet(
     block: u32,
     line: u8,
     data: &[u8],
-) -> Result<()> {
+) -> Result<ssp::DownloadDataPacketResponse> {
     let mut data_cmd = ssp::DownloadDataPacketCommand::create(block, line, data)?;
     data_cmd.set_sequence_id(seq_id);
 
@@ -173,12 +198,14 @@ fn send_data_packet(
         return Err(Error::InvalidLength((read, exp_len)));
     }
 
+    log::trace!("DownloadDataPacket response: {:#?}", data_res.buf());
+
     data_res.verify_checksum()?;
 
     let status = data_res.response_status();
     let exp_status = ssp::ResponseStatus::Ok;
     if status == exp_status {
-        Ok(())
+        Ok(data_res)
     } else {
         Err(Error::Firmware(format!(
             "invalid firmware download status: {status}, expected: {exp_status}"
@@ -199,11 +226,11 @@ fn send_firmware(serial_path: &str, file_path: &str) -> Result<()> {
 
     send_sync(&mut port)?;
 
-    send_program_firmware_command(&mut port)?;
+    let block_len = send_program_firmware_command(&mut port)? as usize;
 
     send_header(&mut port, &header)?;
 
-    send_ram(&mut port, ram)?;
+    send_ram(&mut port, ram, block_len)?;
 
     // sleep for 2.5 seconds to allow unit to run the RAM code we just sent
     // (recommended by SSP Implementation Guide)
@@ -213,7 +240,7 @@ fn send_firmware(serial_path: &str, file_path: &str) -> Result<()> {
 
     send_header(&mut port, &header)?;
 
-    send_dataset(&mut port, data)?;
+    send_dataset(&mut port, data, block_len)?;
 
     log::info!("Successfully sent firmware file");
 
@@ -267,6 +294,11 @@ fn main() -> Result<()> {
     let serial_path = args.serial;
     let file_path = args.file;
 
-    send_firmware(serial_path.as_str(), file_path.as_str())?;
+    if let Err(err) = send_firmware(serial_path.as_str(), file_path.as_str()) {
+        log::error!("Error sending firmware: {err}");
+        log::info!("Resetting device...");
+        let mut port = connect(serial_path.as_str(), 9600)?;
+        send_reset(&mut port)?;
+    }
     check_online(serial_path.as_str())
 }
